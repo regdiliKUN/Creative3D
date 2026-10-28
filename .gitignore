@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+*.manifest
+
+# 运行产物
+exports/*
+!exports/.gitkeep
+.selftest/
+*.log
+
+# 旧版本包体（体积大，不放仓库）
+legacy_v1/
+
+# 构建出的可执行程序（放到 GitHub Release，不进仓库）
+*.exe
+*.msi
+
+# 临时截图
+_ui*.png
+_preview*.png
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
