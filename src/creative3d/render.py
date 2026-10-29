@@ -74,7 +74,22 @@ def _ramp(palette: config.ModelPalette, steps: int = 96) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+_BG_CACHE: dict[tuple, Image.Image] = {}
+_BG_CACHE_ORDER: list[tuple] = []
+_BG_CACHE_MAX = 12
+
+
 def _background(size: tuple[int, int], palette: config.ModelPalette) -> Image.Image:
+    """竖向渐变 + 中央提亮的背景。
+
+    背景只取决于「尺寸 + 配色」，跟模型无关，而逐像素算一张 1600×1600 的渐变要 70ms
+    —— 这在拖拽时是压倒性的开销。做一层小 LRU 缓存后，同一视口的连续帧几乎零成本。
+    """
+    key = (size[0], size[1], palette.id)
+    hit = _BG_CACHE.get(key)
+    if hit is not None:
+        return hit.copy()
+
     w, h = size
     top = np.array(palette.bg_top, dtype=np.float64)
     bottom = np.array(palette.bg_bottom, dtype=np.float64)
@@ -85,8 +100,21 @@ def _background(size: tuple[int, int], palette: config.ModelPalette) -> Image.Im
     ys = np.linspace(-1.0, 1.0, h)[:, None]
     radial = np.clip(1.0 - np.sqrt(xs ** 2 + ys ** 2) * 0.75, 0.0, 1.0)[:, :, None]
     col = col + radial * np.array([10.0, 12.0, 16.0])[None, None, :]
+    # 底部「打光地面」：在画面下方中央放一团柔和的暖白光，
+    # 让物体的落地阴影有可对比的衬底（否则在深底上暗影完全看不出来）。
+    # 这团光同时充当「地面」——物体在它上面“坐”着，而不是悬在空中。
+    fx = (np.linspace(-1.0, 1.0, w) / 1.05)[None, :]
+    fy = ((np.linspace(-1.0, 1.0, h) - 0.40) / 0.70)[:, None]
+    floor = np.exp(-(fx ** 2 + fy ** 2) * 1.35)[:, :, None]
+    col = col + floor * np.array([42.0, 48.0, 58.0])[None, None, :]
     arr = np.clip(col, 0, 255).astype(np.uint8)
-    return Image.fromarray(np.broadcast_to(arr, (h, w, 3)), "RGB")
+    img = Image.fromarray(np.broadcast_to(arr, (h, w, 3)), "RGB")
+
+    _BG_CACHE[key] = img
+    _BG_CACHE_ORDER.append(key)
+    while len(_BG_CACHE_ORDER) > _BG_CACHE_MAX:
+        _BG_CACHE.pop(_BG_CACHE_ORDER.pop(0), None)
+    return img.copy()
 
 
 class _CameraSpace:
@@ -103,7 +131,7 @@ class _CameraSpace:
         fov = math.radians(42.0)
         focal = 1.0 / math.tan(fov * 0.5)
         self.focal = focal
-        self.dist = max(radius * 2.6, radius * focal / 0.80) / max(cam.zoom, 0.05)
+        self.dist = max(radius * 2.6, radius * focal / 0.90) / max(cam.zoom, 0.05)
 
         cy, sy = math.cos(cam.yaw), math.sin(cam.yaw)
         cp, sp = math.cos(cam.pitch), math.sin(cam.pitch)
@@ -216,7 +244,16 @@ def render_scene(
     else:
         base = Image.new("RGB", (w, h), palette.bg_bottom)
 
-    draw = ImageDraw.Draw(base, "RGBA")
+    # 注意：ImageDraw.Draw 一旦被强制指定为 "RGBA" 模式，在 RGB 底图上会创建
+    # 一个内部副本，导致后续对 base 的 paste 操作“失效”（底座阴影不显示）。
+    # 因此这里走底图自己的模式；只有在真正需要半透明描边（wireframe）时才转 RGBA。
+    if shadow and not transparent:
+        _draw_ground_shadow(base, space, mesh, palette)
+
+    if wire and base.mode != "RGBA":
+        base = base.convert("RGBA")
+
+    draw = ImageDraw.Draw(base)
     ramp = _ramp(palette)
     colors = [tuple(int(v) for v in row) for row in ramp]
 
@@ -226,9 +263,6 @@ def render_scene(
         clipped = int(idx.size - max_tris)
         idx = idx[:max_tris]
         ramp_idx = ramp_idx[:max_tris]
-
-    if shadow and not transparent:
-        _draw_ground_shadow(base, space, mesh, palette)
 
     # 一次投影所有顶点，然后按面索引取用
     screen, vz = space.project(mesh.verts)
@@ -279,7 +313,6 @@ def render_scene(
 def _draw_ground_shadow(img: Image.Image, space: _CameraSpace, mesh: Mesh, palette) -> None:
     """在模型底部画一层柔和的落地阴影（多层椭圆近似高斯模糊，成本可控）。"""
     lo, hi = mesh.bounds()
-    base_center = np.array([[0.0, 0.0, float(lo[2])]])
     pts = np.array(
         [
             [0.0, 0.0, float(lo[2])],
@@ -289,21 +322,39 @@ def _draw_ground_shadow(img: Image.Image, space: _CameraSpace, mesh: Mesh, palet
     )
     scr, _ = space.project(pts)
     cx, cy = float(scr[0][0]), float(scr[0][1])
-    rx = max(6.0, abs(float(scr[1][0]) - cx))
-    ry = max(4.0, abs(float(scr[2][1]) - cy) * 0.55)
+    rx = max(8.0, abs(float(scr[1][0]) - cx))
+    ry = max(5.0, abs(float(scr[2][1]) - cy) * 0.6)
     if not all(math.isfinite(v) for v in (cx, cy, rx, ry)):
         return
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    layers = 7
-    for i in range(layers):
-        k = 1.0 + i * 0.55
-        alpha = int(46 * (1.0 - i / layers) ** 1.6)
-        od.ellipse([cx - rx * k, cy - ry * k, cx + rx * k, cy + ry * k], fill=(0, 0, 0, alpha))
-    overlay = overlay.filter(ImageFilter.GaussianBlur(max(1.0, img.size[0] / 340.0)))
-    rgba = img.convert("RGBA")
-    rgba.alpha_composite(overlay)
-    img.paste(rgba.convert("RGB"), (0, 0))
+    # 在 1/3 分辨率的灰度蒙版上画椭圆并模糊，再放大合成。
+    # 高斯模糊的代价随像素数线性增长，全尺寸模糊 1600×1600 要 45ms，缩小后只要 5ms。
+    ds = 3
+    small_w = max(8, img.size[0] // ds)
+    small_h = max(8, img.size[1] // ds)
+    mask = Image.new("L", (small_w, small_h), 0)
+    md = ImageDraw.Draw(mask)
+    layers = 6
+    # 必须从「最大最淡」画到「最小最亮」：后画的盖在先画的上面，
+    # 这样中心叠到最高 alpha、外圈只保留最淡一层，形成柔和渐变。
+    # 若顺序反过来，亮心会被外层淡椭圆盖掉，整片只剩 alpha≈2 的微影。
+    # 深色背景上纯暗影对比很弱，所以中心峰值给到 ~175，并保证阴影明显比
+    # 周围「打光地面」更暗，才能让人看出物体“坐”在地上。
+    for i in reversed(range(layers)):
+        k = 1.0 + i * 0.30
+        alpha = int(175 * (1.0 - i / layers) ** 1.5)
+        md.ellipse(
+            [
+                (cx - rx * k) / ds, (cy - ry * k) / ds,
+                (cx + rx * k) / ds, (cy + ry * k) / ds,
+            ],
+            fill=alpha,
+        )
+    mask = mask.filter(ImageFilter.GaussianBlur(max(1.2, small_w / 300.0)))
+    mask = mask.resize(img.size, Image.BILINEAR)
+
+    # 用蒙版把暗色叠到底图上，避免整幅图来回 convert
+    shade = Image.new("RGB", img.size, (0, 0, 0))
+    img.paste(shade, (0, 0), mask)
 
 
 def draw_gizmo(draw: ImageDraw.ImageDraw, space: _CameraSpace, rect: tuple[int, int, int, int], palette) -> None:
