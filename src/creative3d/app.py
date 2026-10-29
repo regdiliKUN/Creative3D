@@ -78,6 +78,13 @@ def run_selftest(out_dir: Path) -> int:
     from .imaging import analyze
     from PIL import Image
 
+    # 控制台可能是 GBK 代码页（中文 Windows），报告里有 cm³ 之类的字符会编码失败；
+    # 报告本身写的是 UTF-8 文件，这里只把 stdout 兜住，别让自检因为打印而失败。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        pass
+
     log = logsetup.get("selftest")
     out_dir = out_dir if out_dir.is_absolute() else Path.cwd() / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -131,6 +138,31 @@ def run_selftest(out_dir: Path) -> int:
             lines.append(f"[FAIL] {spec.id:8s} 异常：{type(exc).__name__}: {exc}")
             lines.append(traceback.format_exc())
 
+    # 概念模式抽样（v3 主力路径）
+    from . import concepts, printcheck, quality as _q, sdfmesh
+
+    sample = ("vase", "mug", "cat", "gear", "house", "mushroom", "heart", "tree")
+    for cid in sample:
+        started = time.perf_counter()
+        try:
+            bp = concepts.make_params(1234, salt=cid)
+            mesh = sdfmesh.mesh_from_sdf(concepts.build(cid, bp), _q.get("standard"))
+            mesh.normalize(config.MODEL_TARGET_MM)
+            ok, boundary, nonmanifold = mesh.check_watertight()
+            rep = printcheck.analyze(mesh)
+            elapsed = (time.perf_counter() - started) * 1000
+            healthy = ok and rep.volume_cm3 > 0
+            failures += 0 if healthy else 1
+            lines.append(
+                f"[{'OK' if healthy else 'FAIL'}] 概念 {cid:10s} 面 {mesh.n_faces:6d} "
+                f"封闭 {ok} 非流形 {nonmanifold} {rep.bbox_text()} "
+                f"{rep.volume_cm3:6.1f}cm³ 悬垂 {rep.overhang_ratio * 100:3.0f}% "
+                f"评级 {rep.grade} 耗时 {elapsed:6.0f}ms"
+            )
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            lines.append(f"[FAIL] 概念 {cid}: {type(exc).__name__}: {exc}")
+
     # 导出全链路
     try:
         mesh = generators.build("vase", GenContext(seed=7, res=60, a=45, b=45))
@@ -157,8 +189,11 @@ def run_selftest(out_dir: Path) -> int:
     lines += ["", f"RESULT: {'PASS' if failures == 0 else f'FAIL ({failures})'}"]
     report = out_dir / "selftest-report.txt"
     report.write_text("\n".join(lines), encoding="utf-8")
-    print("\n".join(lines))
-    print(f"\n报告已写入：{report}")
+    try:
+        print("\n".join(lines))
+        print(f"\n报告已写入：{report}")
+    except Exception:  # noqa: BLE001 - 无控制台的打包版本来就打印不了
+        pass
     return 0 if failures == 0 else 1
 
 
@@ -192,8 +227,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest is not None:
         return run_selftest(Path(args.selftest))
 
-    lock = _single_instance_lock()
-    if lock is None:
+    # 开发期截图 / 自动化测试需要能同时开多个实例
+    lock = None if os.environ.get("C3D_NO_SINGLETON") else _single_instance_lock()
+    if lock is None and not os.environ.get("C3D_NO_SINGLETON"):
         return 0
     _set_app_id()
 

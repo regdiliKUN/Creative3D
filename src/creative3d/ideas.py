@@ -13,7 +13,7 @@ import random
 import zlib
 from dataclasses import asdict, dataclass, field
 
-from . import registry
+from . import concepts, registry
 
 _TITLES_A = (
     "潮汐回响", "荒原生灵", "深海化石", "赛博祭坛", "苔原遗物", "极光褶皱",
@@ -109,14 +109,24 @@ def generate_idea(
     stats: str = "",
     source: str = "",
     image_notes: list[str] | None = None,
+    concept_id: str | None = None,
+    size_mm: float = 0.0,
+    quality_label: str = "",
 ) -> Idea:
+    concept = concepts.get(concept_id) if concept_id else None
     spec = registry.get(form_id)
+    label = concept.label if concept else spec.label
+    detail = concept.note if concept else spec.detail
+    tips = (concept.hint if concept and concept.hint else spec.tips)
     # 用 crc32 而不是内置 hash：后者在每个进程里随机化，会破坏「同种子同文案」
-    rng = random.Random((int(seed) * 7919) ^ (zlib.crc32(form_id.encode("utf-8")) & 0xFFFF))
+    key = concept_id or form_id
+    rng = random.Random((int(seed) * 7919) ^ (zlib.crc32(key.encode("utf-8")) & 0xFFFF))
 
     head = rng.choice(_TITLES_A)
-    tail = rng.choice(_TITLES_B.get(form_id, ("之作",)))
-    title = head + tail
+    if concept:
+        title = f"{head} · {label}"
+    else:
+        title = head + rng.choice(_TITLES_B.get(form_id, ("之作",)))
 
     simile = rng.choice(_SIMILES)
     metaphor = rng.choice(_METAPHORS)
@@ -126,13 +136,13 @@ def generate_idea(
 
     story = (
         f"它像{simile}，又像{metaphor}。在{light}下显出{texture}，"
-        f"整体是{palette_phrase}。{spec.detail}"
+        f"整体是{palette_phrase}。{detail}"
     )
     if source:
         story += f" 这一件的起点是：{source}。"
 
     tags = rng.sample(_TAGS, 3)
-    tags.append(spec.label)
+    tags.append(label)
     if image_notes:
         tags.extend(n for n in image_notes[:2] if n)
 
@@ -141,11 +151,14 @@ def generate_idea(
         story=story,
         material=rng.choice(_MATERIALS),
         usage=rng.choice(_USAGES),
-        tip=spec.tips or rng.choice(_TIPS),
+        tip=tips or rng.choice(_TIPS),
         tags=tags,
         palette_label=palette_label,
         source=source,
-        extra={"stats": stats, "res": res, "seed": int(seed), "params": params or {}},
+        extra={
+            "stats": stats, "res": res, "seed": int(seed), "params": params or {},
+            "concept": concept_id or "", "size_mm": size_mm, "quality": quality_label,
+        },
     )
 
 
@@ -158,11 +171,18 @@ def idea_card_text(
     params: dict,
     palette_id: str,
     image_info: dict | None = None,
+    concept_id: str | None = None,
+    size_mm: float = 0.0,
+    quality_label: str = "",
+    report=None,
 ) -> str:
     """导出为可归档的 Markdown 创意卡。"""
+    concept = concepts.get(concept_id) if concept_id else None
     spec = registry.get(form_id)
     head_a = registry.param_label(form_id, "a")
     head_b = registry.param_label(form_id, "b")
+    if concept:
+        head_a, head_b = concept.pa[0], concept.pb[0]
 
     lines = [
         f"# {idea.title}",
@@ -171,13 +191,20 @@ def idea_card_text(
         "",
         "## 设计参数",
         "",
-        f"- 形态族：{spec.label}（{spec.desc}）",
-        f"- 随机种子：{seed}",
-        f"- 细节密度：{int(res)} / 100",
-        f"- {head_a}：{params.get('a', 0):.0f} / 100",
-        f"- {head_b}：{params.get('b', 0):.0f} / 100",
-        f"- 配色：{idea.palette_label or palette_id}",
     ]
+    if concept:
+        lines.append(f"- 模型：{concept.label}（{concept.category} · {concept.note}）")
+    else:
+        lines.append(f"- 形态族：{spec.label}（{spec.desc}）")
+    lines.append(f"- 随机种子：{seed}")
+    if size_mm:
+        lines.append(f"- 目标尺寸：最长边 {size_mm:.0f} mm")
+    if quality_label:
+        lines.append(f"- 精度档位：{quality_label}")
+    lines.append(f"- 细节密度：{int(res)} / 100")
+    lines.append(f"- {head_a}：{params.get('a', 0):.0f} / 100")
+    lines.append(f"- {head_b}：{params.get('b', 0):.0f} / 100")
+    lines.append(f"- 配色：{idea.palette_label or palette_id}")
     if idea.source:
         lines.append(f"- 灵感来源：{idea.source}")
     if image_info:
@@ -195,16 +222,21 @@ def idea_card_text(
         "",
         f"- 推荐用途：{idea.usage}",
         f"- 建议材质：{idea.material}",
-        f"- 打印提示：{_TIPS[0] if not spec.tips else spec.tips}",
+        f"- 打印提示：{idea.tip}",
         f"- 关键词：{' / '.join(idea.tags)}",
+    ]
+    if report is not None:
+        lines += ["", "## 打印体检", ""]
+        lines += [f"- {line}" for line in report.to_lines()]
+    lines += [
         "",
         "## 打印备注",
         "",
-        "模型单位毫米、最长边 100mm、底面贴合 z=0；建议先导出一张预览图确认观感。",
+        "模型单位毫米、底面贴合 z=0；STL 可直接进切片软件，3MF 额外记录了单位与对象名。",
         "",
         "---",
         "",
-        f"由「3D 建模创意生成器 v2」生成 · {form_id} · seed {seed}",
+        f"由「3D 建模创意生成器 v3」生成 · {concept_id or form_id} · seed {seed}",
         "",
     ]
     return "\n".join(lines)

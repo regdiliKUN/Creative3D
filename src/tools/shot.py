@@ -23,7 +23,10 @@ try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except Exception:  # noqa: BLE001
     pass
-TITLE = "3D 建模创意生成器 v2.0.0"
+sys.path.insert(0, str(SRC))
+from creative3d import config as _cfg  # noqa: E402
+
+TITLE = f"{_cfg.APP_NAME} v{_cfg.APP_VERSION}"
 
 
 def find_window(title: str) -> int:

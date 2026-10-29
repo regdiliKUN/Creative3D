@@ -12,15 +12,22 @@ from typing import Any
 
 from . import config, logsetup
 
-SCHEMA = 2
+SCHEMA = 3
 
 DEFAULTS: dict[str, Any] = {
     "schema": SCHEMA,
+    "mode": "concept",
+    "concept": "vase",
     "form": "vase",
     "seed": 2026,
     "res": 62.0,
     "params": {"a": 45.0, "b": 45.0},
     "palette": "frost",
+    "quality": "fine",
+    "size_mm": 100.0,
+    "wall_mm": 1.8,
+    "hollow": None,
+    "style": {},
     "auto_rotate": True,
     "wire": False,
     "shadow": True,
@@ -70,6 +77,15 @@ class Settings:
     def _migrate(self, data: dict[str, Any]) -> dict[str, Any]:
         version = int(data.get("schema", 1) or 1)
         out = dict(data)
+        if version < 3:
+            # v2 只有形态 + 参数，补上 v3 的「概念模型 / 精度 / 尺寸」默认项
+            out.setdefault("mode", DEFAULTS["mode"])
+            out.setdefault("concept", DEFAULTS["concept"])
+            out.setdefault("quality", DEFAULTS["quality"])
+            out.setdefault("size_mm", DEFAULTS["size_mm"])
+            out.setdefault("wall_mm", DEFAULTS["wall_mm"])
+            out.setdefault("hollow", DEFAULTS["hollow"])
+            out.setdefault("style", {})
         if version < 2:
             # v1 只有 form/seed/res/params，补上 v2 的默认项
             out.setdefault("palette", DEFAULTS["palette"])

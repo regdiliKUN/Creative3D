@@ -18,9 +18,9 @@ from pathlib import Path
 
 APP_NAME = "3D 建模创意生成器"
 APP_SHORT = "Creative3D"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 APP_BUILD = "2026.10"
-APP_TAGLINE = "参数化形态 · 多模态灵感 · 一键导出"
+APP_TAGLINE = "任意提示词 · 高精度建模 · 打印体检 · 一键导出"
 
 MIN_WINDOW_SIZE = (1200, 780)
 DEFAULT_WINDOW_SIZE = (1500, 940)
@@ -239,3 +239,33 @@ def font(size: int = 10, bold: bool = False, family: str | None = None) -> tuple
 
 def mono_font(size: int = 9) -> tuple:
     return ("Consolas", size, "normal")
+
+
+_SCALE_CACHE: float | None = None
+
+
+def ui_scale() -> float:
+    """界面缩放系数（相对 96 DPI）。
+
+    Tk 的控件宽度是「物理像素」，而字体由 tk scaling 放大；
+    高分屏上如果不按比例放大面板宽度，文字就会把面板撑爆。
+    """
+    global _SCALE_CACHE
+    if _SCALE_CACHE is not None:
+        return _SCALE_CACHE
+    scale = 1.0
+    try:
+        import tkinter as tk
+
+        root = tk._default_root
+        if root is not None:
+            scale = float(root.tk.call("tk", "scaling")) / 1.3333
+    except Exception:  # noqa: BLE001 - 探测失败就按 1.0 处理
+        scale = 1.0
+    _SCALE_CACHE = max(1.0, min(2.6, scale))
+    return _SCALE_CACHE
+
+
+def sp(value: float) -> int:
+    """把设计稿里的像素值换算成当前 DPI 下的像素。"""
+    return int(round(value * ui_scale()))

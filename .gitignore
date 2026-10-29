@@ -18,7 +18,7 @@ exports/*
 *.log
 
 # 旧版本包体（体积大，不放仓库）
-legacy_v1/
+legacy_v*/
 
 # 构建出的可执行程序（放到 GitHub Release，不进仓库）
 *.exe

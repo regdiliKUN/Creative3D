@@ -1,33 +1,51 @@
-"""exporter.py —— 导出 STL / OBJ / PNG / 创意卡。
+"""exporter.py —— 导出 STL / 3MF / OBJ / PNG / 创意卡 / 打印体检报告。
 
 要点：
 * 所有写入都是原子的（临时文件 + 替换），中途失败不会留下半截文件；
 * 文件重名自动加序号，不会覆盖用户已有作品；
-* 每个步骤都会回调进度，界面可以显示「正在渲染预览图 2/4」；
+* 每个步骤都会回调进度，界面可以显示「正在渲染预览图 2/5」；
 * 磁盘满 / 没权限等异常统一转成 ExportError，附中文建议。
 """
 
 from __future__ import annotations
 
+import io
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import config, ideas, registry
+import numpy as np
+
+from . import config, ideas, printcheck, registry
 from .errors import ExportError, humanize_oserror
 from .mesh import Mesh, atomic_write_bytes, atomic_write_text, safe_filename
 from .render import Camera, render_scene
 
 ProgressFn = Callable[[str, float], None]
 
+_CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+</Types>"""
+
+_RELS = """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/3dmodel.model" Id="rel0" \
+Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>"""
+
 
 @dataclass
 class ExportOptions:
     stl: bool = True
     obj: bool = False
+    three_mf: bool = False
     png: bool = True
     card: bool = True
+    report: bool = False
     png_width: int = 1400
     png_height: int = 1050
     supersample: int = 2
@@ -56,6 +74,41 @@ def _unique_base(folder: Path, base: str, suffixes: list[str]) -> str:
     return candidate
 
 
+def three_mf_bytes(mesh: Mesh, name: str = "creative3d") -> bytes:
+    """写一个最小但合规的 3MF（单对象、毫米单位）。
+
+    3MF 比 STL 多存了「单位」和「对象名」，切片软件导入时不用再猜尺寸。
+    """
+    verts = mesh.verts
+    faces = mesh.faces + 1  # 3MF 索引从 1 开始
+    v_parts = [f'<vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>' for x, y, z in verts.tolist()]
+    f_parts = [f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in faces.tolist()]
+    safe_name = name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    model = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" xml:lang="zh-CN" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
+        f' <metadata name="Title">{safe_name}</metadata>\n'
+        f' <metadata name="Designer">Creative3D</metadata>\n'
+        ' <resources>\n'
+        f'  <object id="1" type="model" name="{safe_name}">\n'
+        '   <mesh>\n'
+        f'    <vertices>{"".join(v_parts)}</vertices>\n'
+        f'    <triangles>{"".join(f_parts)}</triangles>\n'
+        '   </mesh>\n'
+        '  </object>\n'
+        ' </resources>\n'
+        ' <build><item objectid="1"/></build>\n'
+        '</model>\n'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", _CONTENT_TYPES)
+        zf.writestr("_rels/.rels", _RELS)
+        zf.writestr("3D/3dmodel.model", model)
+    return buf.getvalue()
+
+
 def export_bundle(
     mesh: Mesh,
     *,
@@ -70,6 +123,10 @@ def export_bundle(
     out_dir: Path,
     options: ExportOptions,
     camera: Camera | None = None,
+    concept_id: str | None = None,
+    size_mm: float = 0.0,
+    quality_label: str = "",
+    print_report: printcheck.PrintReport | None = None,
     on_progress: ProgressFn | None = None,
     token=None,
 ) -> ExportResult:
@@ -99,14 +156,19 @@ def export_bundle(
     suffixes = []
     if options.stl:
         suffixes.append(".stl")
+    if options.three_mf:
+        suffixes.append(".3mf")
     if options.obj:
         suffixes.append(".obj")
     if options.png:
         suffixes.append(".png")
     if options.card:
         suffixes.append(".md")
+    if options.report:
+        suffixes.append(".txt")
 
-    base = safe_filename(f"{idea.title}_{registry.get(form_id).label}_{seed}", fallback="creative3d")
+    label = registry.get(form_id).label
+    base = safe_filename(f"{idea.title}_{label}_{seed}", fallback="creative3d")
     base = _unique_base(out_dir, base, suffixes)
 
     steps = max(1, len(suffixes))
@@ -118,10 +180,19 @@ def export_bundle(
         tick(stage, done / steps)
         done += 1
 
+    report = print_report
+    if report is None and (options.report or options.card):
+        tick("检查可打印性", 0.02)
+        report = printcheck.analyze(mesh)
+
     try:
         if options.stl:
             step("导出 STL 模型")
             atomic_write_bytes(out_dir / f"{base}.stl", mesh.stl_bytes(base))
+
+        if options.three_mf:
+            step("导出 3MF 模型")
+            atomic_write_bytes(out_dir / f"{base}.3mf", three_mf_bytes(mesh, base))
 
         if options.obj:
             step("导出 OBJ 模型")
@@ -159,8 +230,19 @@ def export_bundle(
                 params=params,
                 palette_id=palette_id,
                 image_info=image_info,
+                concept_id=concept_id,
+                size_mm=size_mm,
+                quality_label=quality_label,
+                report=report,
             )
             atomic_write_text(out_dir / f"{base}.md", text, encoding="utf-8")
+
+        if options.report and report is not None:
+            step("写打印体检报告")
+            atomic_write_text(
+                out_dir / f"{base}.txt", printcheck.report_text(report, title=idea.title),
+                encoding="utf-8",
+            )
 
         tick("完成", 1.0)
     except OSError as exc:

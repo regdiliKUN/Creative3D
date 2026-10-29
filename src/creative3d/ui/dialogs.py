@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, ttk
 
 from .. import config, shortcut
 from . import theme
@@ -76,52 +76,120 @@ class Modal(tk.Toplevel):
 
 
 class ExportDialog(Modal):
-    def __init__(self, parent, *, defaults: dict, out_dir: Path, title: str, stats: str) -> None:
-        super().__init__(parent, "导出", width=540)
+    def __init__(self, parent, *, defaults: dict, out_dir: Path, title: str, stats: str,
+                 report=None) -> None:
+        super().__init__(parent, "导出", width=660)
         self.set_subtitle(f"《{title}》 · {stats}")
 
         self.options = dict(defaults)
         self.out_dir = out_dir
+        self.report = report
 
-        tk.Label(self.body, text="导出内容", bg=T.panel, fg=T.text_dim,
+        columns = tk.Frame(self.body, bg=T.panel)
+        columns.pack(fill="both", expand=True)
+        left = tk.Frame(columns, bg=T.panel)
+        left.pack(side="left", fill="both", expand=True)
+        right = tk.Frame(columns, bg=T.panel)
+        right.pack(side="left", fill="both", expand=True, padx=(20, 0))
+
+        # ---------------- 左：导出内容
+        tk.Label(left, text="导出内容", bg=T.panel, fg=T.text_dim,
                  font=theme.f(9)).pack(anchor="w", pady=(4, 6))
-        row = tk.Frame(self.body, bg=T.panel)
+        row = tk.Frame(left, bg=T.panel)
         row.pack(fill="x")
         self._chips: dict[str, Chip] = {}
-        for key, label, tip in (
-            ("stl", "STL 模型", "3D 打印/切片，二进制、单位毫米、已缩放到 100mm"),
-            ("obj", "OBJ 模型", "导入 Blender / Rhino 二次加工"),
-            ("png", "预览图", "高分辨率渲染图，2× 超采样抗锯齿"),
-            ("card", "创意卡", "Markdown 文案，含参数与打印建议"),
+        for i, (key, label, tip) in enumerate(
+            (("stl", "STL 模型", "最通用的 3D 打印格式，二进制、单位毫米"),
+             ("three_mf", "3MF 模型", "带单位与对象名，切片软件导入不用猜尺寸"),
+             ("obj", "OBJ 模型", "导入 Blender / Rhino 二次加工"),
+             ("png", "预览图", "高分辨率渲染图，2× 超采样抗锯齿"),
+             ("card", "创意卡", "Markdown 文案，含参数与打印建议"),
+             ("report", "体检报告", "纯文本，含体积/重量/悬垂与摆放建议"))
         ):
             chip = Chip(row, label, lambda k=key: self._toggle(k),
-                        selected=bool(self.options.get(key)), font_size=9, padx=10, pady=6)
-            chip.pack(side="left", padx=(0, 6))
+                        selected=bool(self.options.get(key)), font_size=9, padx=8, pady=6,
+                        anchor="w")
+            chip.grid(row=i // 2, column=i % 2, padx=3, pady=3, sticky="nsew")
             Tooltip(chip, tip)
             self._chips[key] = chip
+        for col in range(2):
+            row.columnconfigure(col, weight=1, uniform="fmt")
 
-        tk.Label(self.body, text="预览图尺寸", bg=T.panel, fg=T.text_dim,
+        tk.Label(left, text="预览图尺寸", bg=T.panel, fg=T.text_dim,
                  font=theme.f(9)).pack(anchor="w", pady=(14, 6))
-        self.size_seg = Segmented(self.body, ["1200×900", "1400×1050", "2000×1500"],
-                                  self._on_size)
+        self.size_seg = Segmented(left, ["1200×900", "1400×1050", "2000×1500"], self._on_size)
         self.size_seg.pack(anchor="w")
         current = (int(self.options.get("png_width", 1400)), int(self.options.get("png_height", 1050)))
         index = {1200: 0, 1400: 1, 2000: 2}.get(current[0], 1)
         self.size_seg.select(index, notify=False)
         self._size_map = [(1200, 900), (1400, 1050), (2000, 1500)]
 
-        transparent_row = tk.Frame(self.body, bg=T.panel)
+        transparent_row = tk.Frame(left, bg=T.panel)
         transparent_row.pack(fill="x", pady=(14, 0))
-        tk.Label(transparent_row, text="透明背景（不要背景渐变）", bg=T.panel, fg=T.text_dim,
+        tk.Label(transparent_row, text="透明背景", bg=T.panel, fg=T.text_dim,
                  font=theme.f(9)).pack(side="left")
         self.transparent = Toggle(transparent_row, value=bool(self.options.get("transparent")),
                                   command=self._on_transparent)
         self.transparent.pack(side="right")
 
-        tk.Label(self.body, text="导出位置", bg=T.panel, fg=T.text_dim,
-                 font=theme.f(9)).pack(anchor="w", pady=(14, 6))
-        dir_row = tk.Frame(self.body, bg=T.panel)
-        dir_row.pack(fill="x")
+        # ---------------- 右：精度与工艺
+        tk.Label(right, text="精度", bg=T.panel, fg=T.text_dim,
+                 font=theme.f(9)).pack(anchor="w", pady=(4, 6))
+        qrow = tk.Frame(right, bg=T.panel)
+        qrow.pack(fill="x")
+        self._quality_chips: dict[str, Chip] = {}
+        from .. import quality as _quality
+
+        for i, q in enumerate(_quality.QUALITIES):
+            chip = Chip(qrow, f"{q.label} · {q.face_text()}",
+                        lambda qid=q.id: self._set_quality(qid), font_size=8, padx=8, pady=5,
+                        selected=q.id == self.options.get("quality"), anchor="w")
+            chip.grid(row=i // 2, column=i % 2, padx=3, pady=3, sticky="nsew")
+            Tooltip(chip, f"{q.label}：网格 {q.grid} · {q.note}")
+            self._quality_chips[q.id] = chip
+        for col in range(2):
+            qrow.columnconfigure(col, weight=1, uniform="q")
+
+        size_row = tk.Frame(right, bg=T.panel)
+        size_row.pack(fill="x", pady=(14, 0))
+        tk.Label(size_row, text="目标尺寸", bg=T.panel, fg=T.text_dim,
+                 font=theme.f(9)).pack(side="left")
+        self.size_var = tk.StringVar(value=f"{float(self.options.get('size_mm', 100)):.0f}")
+        self.size_entry = ttk.Entry(size_row, textvariable=self.size_var, width=6,
+                                    style="C3D.TEntry", justify="center")
+        self.size_entry.pack(side="right")
+        tk.Label(size_row, text="mm", bg=T.panel, fg=T.text_mute,
+                 font=theme.f(8)).pack(side="right", padx=4)
+
+        hollow_row = tk.Frame(right, bg=T.panel)
+        hollow_row.pack(fill="x", pady=(10, 0))
+        tk.Label(hollow_row, text="中空（省料）", bg=T.panel, fg=T.text_dim,
+                 font=theme.f(9)).pack(side="left")
+        self.hollow = Toggle(hollow_row, value=bool(self.options.get("hollow")),
+                             command=self._on_hollow)
+        self.hollow.pack(side="right")
+
+        orient_row = tk.Frame(right, bg=T.panel)
+        orient_row.pack(fill="x", pady=(10, 0))
+        tk.Label(orient_row, text="自动摆正（少支撑）", bg=T.panel, fg=T.text_dim,
+                 font=theme.f(9)).pack(side="left")
+        self.orient = Toggle(orient_row, value=bool(self.options.get("auto_orient")),
+                             command=self._on_orient)
+        self.orient.pack(side="right")
+
+        if report is not None:
+            box = tk.Frame(right, bg=T.panel_alt, highlightthickness=1, highlightbackground=T.line)
+            box.pack(fill="x", pady=(14, 0))
+            tk.Label(box, text=f"打印体检 · {report.grade}", bg=T.panel_alt,
+                     fg=T.ok if report.grade == "优" else T.text, font=theme.f(9, True),
+                     anchor="w").pack(fill="x", padx=10, pady=(8, 2))
+            tk.Label(box, text=report.summary(), bg=T.panel_alt, fg=T.text_dim,
+                     font=theme.f(8), anchor="w", justify="left",
+                     wraplength=250).pack(fill="x", padx=10, pady=(0, 8))
+
+        # ---------------- 底部：目录
+        dir_row = tk.Frame(self.footer, bg=T.panel)
+        dir_row.pack(side="left", fill="x", expand=True)
         self.dir_label = tk.Label(dir_row, text=str(out_dir), bg=T.panel_alt, fg=T.text_dim,
                                   font=theme.f(8), anchor="w", padx=10, pady=7)
         self.dir_label.pack(side="left", fill="x", expand=True)
@@ -137,10 +205,11 @@ class ExportDialog(Modal):
     def _toggle(self, key: str) -> None:
         self.options[key] = not self.options.get(key)
         self._chips[key].set_selected(bool(self.options[key]))
-        if key == "png" and not self.options["png"]:
-            self.size_seg.pack_forget()
-        elif key == "png" and self.options["png"]:
-            self.size_seg.pack(anchor="w", before=self.size_seg.master.winfo_children()[-1])
+
+    def _set_quality(self, quality_id: str) -> None:
+        self.options["quality"] = quality_id
+        for qid, chip in self._quality_chips.items():
+            chip.set_selected(qid == quality_id)
 
     def _on_size(self, index: int) -> None:
         w, h = self._size_map[max(0, min(len(self._size_map) - 1, index))]
@@ -150,6 +219,12 @@ class ExportDialog(Modal):
     def _on_transparent(self, value: bool) -> None:
         self.options["transparent"] = bool(value)
 
+    def _on_hollow(self, value: bool) -> None:
+        self.options["hollow"] = bool(value)
+
+    def _on_orient(self, value: bool) -> None:
+        self.options["auto_orient"] = bool(value)
+
     def _pick_dir(self) -> None:
         folder = filedialog.askdirectory(parent=self, initialdir=str(self.out_dir),
                                          title="选择导出目录")
@@ -158,9 +233,17 @@ class ExportDialog(Modal):
             self.dir_label.configure(text=str(self.out_dir))
 
     def _ok(self) -> None:
-        if not any(self.options.get(k) for k in ("stl", "obj", "png", "card")):
+        if not any(self.options.get(k) for k in
+                   ("stl", "three_mf", "obj", "png", "card", "report")):
             self.set_subtitle("至少选择一种导出内容。")
             return
+        raw = self.size_var.get().strip().replace("mm", "").replace("毫米", "")
+        try:
+            size = float(raw)
+        except ValueError:
+            self.set_subtitle("目标尺寸要填 20–400 之间的毫米数。")
+            return
+        self.options["size_mm"] = max(20.0, min(400.0, size))
         self.options["supersample"] = 2
         self.confirm({"options": self.options, "out_dir": self.out_dir})
 
@@ -204,9 +287,9 @@ class HelpDialog(Modal):
         tk.Label(right, text="三步上手", bg=T.panel, fg=T.text,
                  font=theme.f(10, True)).pack(anchor="w")
         steps = (
-            ("1", "选一个形态，或写一句话让我们替你选。"),
-            ("2", "拖动参数滑杆微调；随时可以撤销。"),
-            ("3", "点「导出当前作品」，STL 直接拖进切片软件。"),
+            ("1", "写一句话（猫 / 齿轮 / 城堡 / 花瓶…），或从模型库点一个。"),
+            ("2", "选精度档位、填目标尺寸；风格开关随手叠。"),
+            ("3", "看右下角打印体检，必要时点「摆正」，然后导出。"),
         )
         for num, text in steps:
             row = tk.Frame(right, bg=T.panel)
@@ -218,8 +301,8 @@ class HelpDialog(Modal):
 
         tip = tk.Label(
             self.body,
-            text="小技巧：同一个种子永远生成同样的模型与文案，\n"
-                 "所以看到一个满意的结果时，记下 seed 就能随时复现。",
+            text="小技巧：同一个种子永远生成同样的模型与文案，记下 seed 就能复现。\n"
+                 "精度档位只影响面数与导出体积，不改变造型本身。",
             bg=T.panel_alt, fg=T.text_dim, font=theme.f(8), justify="left",
             padx=12, pady=10, wraplength=500,
         )

@@ -15,7 +15,8 @@ from tkinter import filedialog, messagebox
 
 from PIL import Image
 
-from .. import config, exporter, generators, imaging, nlp, registry, render, shortcut
+from .. import (config, concepts, exporter, generators, imaging, nlp, printcheck,
+                quality, registry, render, shortcut)
 from ..errors import AppError, ExportError
 from ..jobs import Jobs
 from ..mesh import Mesh
@@ -46,7 +47,7 @@ class MainWindow(tk.Tk):
 
         self.title(f"{config.APP_NAME} v{config.APP_VERSION}")
         self.configure(bg=T.bg)
-        self.minsize(*config.MIN_WINDOW_SIZE)
+        self.minsize(config.sp(config.MIN_WINDOW_SIZE[0]), config.sp(config.MIN_WINDOW_SIZE[1]))
         self._restore_geometry()
         theme.init_root(self)
         self._set_icon()
@@ -69,6 +70,11 @@ class MainWindow(tk.Tk):
     def _restore_geometry(self) -> None:
         size = self.settings.get("window_size") or list(config.DEFAULT_WINDOW_SIZE)
         w, h = int(size[0]), int(size[1])
+        if w < config.sp(1100) or h < config.sp(700):
+            # 旧版本（低 DPI）存下来的尺寸在高分屏上会小得没法用
+            w, h = config.sp(config.DEFAULT_WINDOW_SIZE[0]), config.sp(config.DEFAULT_WINDOW_SIZE[1])
+        w = min(w, self.winfo_screenwidth() - 40)
+        h = min(h, self.winfo_screenheight() - 80)
         pos = self.settings.get("window_pos")
         if pos and len(pos) == 2:
             self.geometry(f"{w}x{h}+{int(pos[0])}+{int(pos[1])}")
@@ -188,8 +194,13 @@ class MainWindow(tk.Tk):
         self.session.subscribe("mesh", self._on_mesh)
         self.session.subscribe("palette", self._on_palette)
         self.session.subscribe("idea", self._on_idea)
+        self.session.subscribe("quality", self._on_quality)
 
     def _on_state(self, **_kw) -> None:
+        self.refresh_all()
+
+    def _on_quality(self, **_kw) -> None:
+        self._on_mesh()
         self.refresh_all()
 
     def _on_palette(self, **_kw) -> None:
@@ -240,17 +251,10 @@ class MainWindow(tk.Tk):
         self._final_after = None
         if key != self._mesh_key:
             return
-        snapshot = self.session.snapshot()
-        image = self.session.image
         self.viewport.set_busy(True)
 
         def work(token=None) -> Mesh:
-            ctx = generators.GenContext(
-                seed=snapshot.seed, res=snapshot.res, a=snapshot.a, b=snapshot.b, image=image
-            )
-            mesh = generators.build(snapshot.form, ctx)
-            mesh.normalize(config.MODEL_TARGET_MM)
-            return mesh
+            return self.session.generate_mesh(preview=False)
 
         def done(mesh: Mesh) -> None:
             self.viewport.set_busy(False)
@@ -258,12 +262,24 @@ class MainWindow(tk.Tk):
                 return
             self.viewport.set_mesh(mesh)
             self._update_titles()
-            self.right.refresh_idea(self.session.idea(mesh.stats_text()), stats=mesh.stats_text())
+            stats = mesh.stats_text()
+            self.right.refresh_idea(self.session.idea(stats), stats=stats)
+            self._refresh_check(mesh)
 
         def failed(_exc) -> None:
             self.viewport.set_busy(False)
 
         self.jobs.submit(work, on_done=done, on_error=failed, name="final-mesh")
+
+    def _refresh_check(self, mesh: Mesh | None) -> None:
+        if mesh is None:
+            self.right.refresh_check(None)
+            return
+        try:
+            self.right.refresh_check(printcheck.analyze(mesh))
+        except Exception:  # noqa: BLE001 - 体检失败不该影响主流程
+            log.exception("打印体检失败")
+            self.right.refresh_check(None)
 
     # ================================================================== 刷新
     def refresh_all(self) -> None:
@@ -274,20 +290,23 @@ class MainWindow(tk.Tk):
         self.viewport.set_palette(session.palette())
         self._update_titles()
         self.redo_btn.set_enabled(session.can_redo())
-        self.status_label.configure(
-            text=f"{session.spec.label} · seed {session.seed} · {session.palette_label()}"
-        )
+        if session.is_concept_mode():
+            self.status_label.configure(
+                text=f"{session.title()} · {session.quality.label} · {session.size_mm:.0f}mm"
+                     f" · seed {session.seed}"
+            )
+        else:
+            self.status_label.configure(
+                text=f"{session.title()} · seed {session.seed} · {session.palette_label()}"
+            )
 
     def _update_titles(self) -> None:
         session = self.session
-        params = session.params
-        subtitle = (
-            f"{session.spec.desc} · A {params.get('a', 0):.0f} / B {params.get('b', 0):.0f}"
-            f" · 密度 {session.res:.0f}"
-        )
-        self.viewport.set_titles(f"{session.spec.glyph}  {session.spec.label}", subtitle)
-        if session.spec.needs_image and session.image is None:
+        self.viewport.set_titles(f"{session.glyph()}  {session.title()}", session.subtitle())
+        if not session.is_concept_mode() and session.spec.needs_image and session.image is None:
             self.hint_label.configure(text="提示：这个形态用图片效果最好")
+        elif session.is_concept_mode() and session.hollow and session.wall_mm < 1.2:
+            self.hint_label.configure(text="提示：壁厚低于 1.2mm 打印容易破")
         else:
             self.hint_label.configure(text="")
 
@@ -295,7 +314,68 @@ class MainWindow(tk.Tk):
         self._on_mesh()
 
     # ================================================================== 操作
+    def select_concept(self, concept_id: str) -> None:
+        concept = concepts.get(concept_id)
+        self.session.set_concept(concept_id)
+        self.show_toast(f"已切到「{concept.label}」· {concept.note}", kind="ok")
+
+    def set_quality(self, quality_id: str) -> None:
+        q = quality.get(quality_id)
+        self.session.set_quality(quality_id)
+        self.show_toast(f"精度：{q.label} · {q.face_text()}", kind="ok")
+
+    def set_size(self, mm: float) -> None:
+        self.session.set_size(mm)
+        self.show_toast(f"目标尺寸：{self.session.size_mm:.0f} mm", kind="ok")
+
+    def set_hollow(self, hollow: bool) -> None:
+        self.session.set_hollow(bool(hollow))
+        if self.session.hollow:
+            self.show_toast(f"已中空：壁厚 {self.session.wall_mm:.1f} mm", kind="ok")
+        else:
+            self.show_toast("已改为实心")
+
+    def toggle_style(self, key: str) -> None:
+        if key == "minimal":
+            self.session.set_style("detail", -0.5 if not self.session.has_style("detail")
+                                   or self.session.style.get("detail", 0) >= 0 else 0.0)
+        else:
+            self.session.toggle_style(key)
+        self.left.refresh(self.session)
+
+    def preview_wall(self, mm: float) -> None:
+        self.session.set_wall(mm, record=False)
+
+    def commit_wall(self, mm: float) -> None:
+        self.session.set_wall(mm, record=True)
+
+    def auto_orient(self) -> None:
+        try:
+            mesh = self.session.generate_mesh(preview=False)
+        except Exception as exc:  # noqa: BLE001
+            self.show_error(exc, title="生成失败")
+            return
+        self.viewport.set_busy(True)
+        self.update_idletasks()
+
+        def work(token=None):
+            return printcheck.auto_orient(mesh)
+
+        def done(result) -> None:
+            self.viewport.set_busy(False)
+            oriented, report, label = result
+            self.viewport.set_mesh(oriented)
+            self.right.refresh_check(report)
+            self.show_toast(f"已摆正：{label} · 悬垂降到 {report.overhang_ratio * 100:.0f}%",
+                            kind="ok", duration=3200)
+
+        def failed(_exc) -> None:
+            self.viewport.set_busy(False)
+
+        self.jobs.submit(work, on_done=done, on_error=failed, name="orient")
+
     def select_form(self, form_id: str) -> None:
+        self.session.set_mode("classic")
         self.session.set_form(form_id)
         if registry.get(form_id).needs_image and self.session.image is None:
             self.left.show_image_tab()
@@ -376,9 +456,9 @@ class MainWindow(tk.Tk):
         self.session.apply_prompt_result(result)
         note = result.summary()
         if result.seed is None:
-            note += " · 种子未指定，沿用当前值"
+            note += " · 种子沿用当前值"
         self.left.set_prompt_note(note, kind="ok")
-        self.show_toast("已按文字调整参数 · 可继续用滑杆微调", kind="ok")
+        self.show_toast(f"已生成「{self.session.title()}」· 可继续用滑杆微调", kind="ok")
 
     # ---------------------------------------------------------------- 图片
     def pick_image(self) -> None:
@@ -450,7 +530,8 @@ class MainWindow(tk.Tk):
     # ---------------------------------------------------------------- 导出
     def toggle_export_format(self, key: str) -> None:
         self.export_formats[key] = not self.export_formats.get(key, True)
-        if not any(self.export_formats.get(k) for k in ("stl", "obj", "png", "card")):
+        if not any(self.export_formats.get(k) for k in
+                   ("stl", "three_mf", "obj", "png", "card", "report")):
             self.export_formats[key] = True
             self.show_toast("至少保留一种导出内容", kind="warn")
         self.right.refresh_formats(self.export_formats)
@@ -461,47 +542,67 @@ class MainWindow(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             self.show_error(exc, title="生成失败")
             return
+        session = self.session
         options = {
-            **{k: bool(self.export_formats.get(k)) for k in ("stl", "obj", "png", "card")},
+            **{k: bool(self.export_formats.get(k)) for k in
+               ("stl", "three_mf", "obj", "png", "card", "report")},
             "png_width": 1400,
             "png_height": 1050,
             "transparent": False,
             "supersample": 2,
+            "quality": session.quality_id,
+            "size_mm": session.size_mm,
+            "hollow": session.hollow,
+            "auto_orient": False,
         }
-        idea = self.session.idea(mesh.stats_text())
+        idea = session.idea(mesh.stats_text())
+        report = printcheck.analyze(mesh)
         dialog = dialogs.ExportDialog(
             self,
             defaults=options,
             out_dir=config.exports_dir(self.settings.get("export_dir")),
             title=idea.title,
             stats=mesh.stats_text(),
+            report=report,
         )
         result = dialog.show_modal()
         if not result:
             return
-        self.export_formats.update({k: bool(result["options"].get(k)) for k in ("stl", "obj", "png", "card")})
+        opts = result["options"]
+        self.export_formats.update({
+            k: bool(opts.get(k)) for k in ("stl", "three_mf", "obj", "png", "card", "report")
+        })
         self.right.refresh_formats(self.export_formats)
-        self._run_export(result["options"], Path(result["out_dir"]))
+
+        # 导出窗口里改的精度 / 尺寸 / 中空要真正生效
+        if opts.get("quality") and opts["quality"] != session.quality_id:
+            session.set_quality(opts["quality"])
+        if opts.get("size_mm") and abs(float(opts["size_mm"]) - session.size_mm) > 0.5:
+            session.set_size(float(opts["size_mm"]))
+        if bool(opts.get("hollow")) != session.hollow:
+            session.set_hollow(bool(opts["hollow"]))
+        self._run_export(opts, Path(result["out_dir"]))
 
     def _run_export(self, options: dict, out_dir: Path) -> None:
         if self._export_token is not None:
             self.show_toast("正在导出中，请稍候", kind="warn")
             return
         snapshot = self.session.snapshot()
-        image = self.session.image
-        palette = self.session.palette()
-        palette_id = self.session.palette_id
-        idea = self.session.idea()
-        image_info = self.session.image_info()
+        session = self.session
+        palette = session.palette()
+        palette_id = session.palette_id
+        idea = session.idea()
+        image_info = session.image_info()
         camera = self.viewport.camera
         settings = self.settings
+        auto_orient = bool(options.get("auto_orient"))
 
         def work(token=None):
-            ctx = generators.GenContext(
-                seed=snapshot.seed, res=snapshot.res, a=snapshot.a, b=snapshot.b, image=image
-            )
-            mesh = generators.build(snapshot.form, ctx)
-            mesh.normalize(config.MODEL_TARGET_MM)
+            mesh = session.generate_mesh(preview=False)
+            token.raise_if_cancelled()
+            report = printcheck.analyze(mesh)
+            if auto_orient:
+                mesh, report, _label = printcheck.auto_orient(mesh)
             token.raise_if_cancelled()
 
             def progress(stage: str, frac: float) -> None:
@@ -520,15 +621,21 @@ class MainWindow(tk.Tk):
                 out_dir=out_dir,
                 options=exporter.ExportOptions(
                     stl=bool(options.get("stl")),
+                    three_mf=bool(options.get("three_mf")),
                     obj=bool(options.get("obj")),
                     png=bool(options.get("png")),
                     card=bool(options.get("card")),
+                    report=bool(options.get("report")),
                     png_width=int(options.get("png_width", 1400)),
                     png_height=int(options.get("png_height", 1050)),
                     supersample=int(options.get("supersample", 2)),
                     transparent=bool(options.get("transparent")),
                 ),
                 camera=camera,
+                concept_id=session.concept if session.is_concept_mode() else None,
+                size_mm=session.size_mm,
+                quality_label=session.quality.label,
+                print_report=report,
                 on_progress=progress,
                 token=token,
             )

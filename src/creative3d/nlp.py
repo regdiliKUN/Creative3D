@@ -15,7 +15,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
-from . import registry
+from . import concepts, quality, registry
 
 # 配色关键词（含中英文）
 _PALETTE_WORDS: dict[str, tuple[str, ...]] = {
@@ -56,6 +56,26 @@ _STYLE_RULES: tuple[tuple[tuple[str, ...], str, dict[str, float], str], ...] = (
     (("随机", "惊喜", "随便", "random", "surprise"), "随机种子", {}, "random"),
 )
 
+# 概念模式的风格词：直接改「形体旋钮」而不是某个形态的参数
+_STYLE_FLAGS: tuple[tuple[tuple[str, ...], str, float], ...] = (
+    (("圆润", "柔和", "光滑", "可爱", "卡通", "胖乎乎", "soft", "cute", "smooth"), "organic", 0.28),
+    (("尖锐", "锋利", "棱面", "棱角", "宝石", "切割", "sharp", "faceted", "gem"), "sharp", 0.34),
+    (("粗糙", "风化", "石头", "岩石", "做旧", "斑驳", "rough", "stone", "weathered"), "rough", 0.32),
+    (("扭曲", "缠绕", "拧", "螺旋", "twisted", "twist", "spiral"), "twist", 0.30),
+    (("繁复", "复杂", "密集", "精雕", "细节", "intricate", "detailed"), "detail", 0.22),
+    (("极简", "简单", "干净", "minimal", "simple", "clean"), "detail", -0.24),
+)
+
+_HOLLOW_WORDS = ("中空", "空心", "镂空", "薄壁", "hollow", "thin wall")
+
+_QUALITY_WORDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("草稿", "快速", "看看大形", "draft"), "draft"),
+    (("标准", "普通", "standard", "normal"), "standard"),
+    (("精细", "高清", "高精度", "高细节", "fine", "good", "high detail"), "fine"),
+    (("超精细", "超高精度", "超清", "手办级", "ultra"), "ultra"),
+    (("打印级", "最高", "极致", "print", "max"), "print"),
+)
+
 # 分隔符要包含 "="：很多人会照着命令行习惯写 seed=42
 _NUM_SEED = re.compile(r"(?:种子|seed|编号)\s*[:：#=]?\s*(\d{1,5})", re.I)
 _NUM_RES = re.compile(r"(?:细节|密度|精度|面数|分辨率|detail|quality)\s*[:：=]?\s*(\d{1,3})", re.I)
@@ -65,6 +85,15 @@ _NUM_RES_CN = re.compile(
     r"([零一二三四五六七八九十百]+)"
 )
 _STANDALONE_NUM = re.compile(r"(?<![\d.])(\d{3,4})(?![\d.])")
+# 尺寸：高 120mm / 8 厘米 / size=90
+_NUM_SIZE_MM = re.compile(
+    r"(?:高|长|宽|尺寸|大小|高度|直径|size|height)\s*[:：=]?\s*(\d{1,4}(?:\.\d+)?)\s*(?:mm|毫米|㎜)", re.I
+)
+_NUM_SIZE_CM = re.compile(
+    r"(?:高|长|宽|尺寸|大小|高度|直径|size|height)\s*[:：=]?\s*(\d{1,3}(?:\.\d+)?)\s*(?:cm|厘米|㎝)", re.I
+)
+# 裸写尺寸：8厘米 / 90mm（前面没有「高/尺寸」这类词）
+_BARE_SIZE = re.compile(r"(?<![\d.])(\d{1,4}(?:\.\d+)?)\s*(mm|毫米|㎜|cm|厘米|㎝)", re.I)
 _CN_NUM = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 
 
@@ -97,9 +126,14 @@ def _cn_to_int(token: str) -> int | None:
 class PromptResult:
     text: str = ""
     form_id: str | None = None
+    concept_id: str | None = None
     seed: int | None = None
     res: float | None = None
+    quality: str | None = None
+    size_mm: float | None = None
     palette: str | None = None
+    hollow: bool | None = None
+    style: dict[str, float] = field(default_factory=dict)
     param_delta: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     matched: list[str] = field(default_factory=list)
@@ -107,7 +141,11 @@ class PromptResult:
 
     @property
     def understood(self) -> bool:
-        return bool(self.form_id or self.palette or self.param_delta or self.seed is not None)
+        return bool(
+            self.form_id or self.concept_id or self.palette or self.param_delta
+            or self.seed is not None or self.style or self.quality or self.size_mm
+            or self.random_seed
+        )
 
     def summary(self) -> str:
         if not self.understood:
@@ -154,11 +192,21 @@ def parse(text: str) -> PromptResult:
     if not norm:
         return result
 
+    # 1) 概念模型（能生成任意物体的那套配方）优先
+    concept_id, concept_kw = concepts.match(norm)
+    if concept_id:
+        result.concept_id = concept_id
+        result.matched.append(concept_kw or "")
+        result.notes.append(f"模型「{concepts.get(concept_id).label}」")
+
+    # 2) 经典形态（保留旧入口，图片类形态还要靠它）
     form_id, form_kw = _find_form(norm)
     if form_id:
         result.form_id = form_id
-        result.matched.append(form_kw or "")
-        result.notes.append(f"形态「{registry.get(form_id).label}」")
+        if not concept_id:
+            result.matched.append(form_kw or "")
+            result.notes.append(f"形态「{registry.get(form_id).label}」")
+        result.concept_id = result.concept_id or concept_for_form(form_id)
 
     palette_id, palette_kw = _find_palette(norm)
     if palette_id:
@@ -166,13 +214,33 @@ def parse(text: str) -> PromptResult:
         result.matched.append(palette_kw or "")
         result.notes.append(f"配色「{_palette_label(palette_id)}」")
 
+    # 尺寸（毫米优先，其次厘米，最后允许裸写「8 厘米」「90mm」）
+    size_span: tuple[int, int] | None = None
+    m = _NUM_SIZE_MM.search(norm)
+    if m:
+        result.size_mm = float(max(20.0, min(400.0, float(m.group(1)))))
+        size_span = m.span(1)
+    else:
+        m = _NUM_SIZE_CM.search(norm)
+        if m:
+            result.size_mm = float(max(20.0, min(400.0, float(m.group(1)) * 10.0)))
+            size_span = m.span(1)
+        else:
+            m = _BARE_SIZE.search(norm)
+            if m:
+                value = float(m.group(1))
+                result.size_mm = float(max(20.0, min(400.0, value * 10.0 if m.group(2)[0] in "cC厘" else value)))
+                size_span = m.span(1)
+    if result.size_mm is not None:
+        result.notes.append(f"尺寸 {result.size_mm:.0f}mm")
+
     m = _NUM_SEED.search(norm)
     if m:
         result.seed = int(m.group(1))
         result.notes.append(f"种子 {result.seed}")
     else:
         m2 = _STANDALONE_NUM.search(norm)
-        if m2:
+        if m2 and not (size_span and m2.start(1) >= size_span[0] and m2.end(1) <= size_span[1]):
             result.seed = int(m2.group(1))
             result.notes.append(f"种子 {result.seed}")
 
@@ -188,12 +256,38 @@ def parse(text: str) -> PromptResult:
                 result.res = float(max(0, min(100, value)))
                 result.notes.append(f"细节密度 {int(result.res)}")
 
+    # 精度档位
+    for words, qid in _QUALITY_WORDS:
+        hit = next((w for w in words if w in norm), None)
+        if hit:
+            result.quality = qid
+            result.matched.append(hit)
+            result.notes.append(f"精度「{quality.get(qid).label}」")
+            break
+
+    # 中空
+    if any(w in norm for w in _HOLLOW_WORDS):
+        result.hollow = True
+        result.notes.append("中空壁厚")
+
+    # 风格旋钮（概念模式用）
+    for words, key, amount in _STYLE_FLAGS:
+        hit = next((w for w in words if w in norm), None)
+        if not hit:
+            continue
+        result.matched.append(hit)
+        result.style[key] = result.style.get(key, 0.0) + amount
+        label = {"organic": "更圆润", "sharp": "更硬朗", "rough": "更粗糙",
+                 "twist": "更扭曲", "detail": "细节更强"}.get(key, key)
+        result.notes.append(label)
+
     for words, desc, delta, extra in _STYLE_RULES:
         hit = next((w for w in words if w in norm), None)
         if not hit:
             continue
         result.matched.append(hit)
-        result.notes.append(desc)
+        if desc not in result.notes:
+            result.notes.append(desc)
         for key, value in delta.items():
             result.param_delta[key] = result.param_delta.get(key, 0.0) + value
         # 用户写了「细节 80」就不要再被风格词悄悄改成 96：显式数字优先
@@ -205,6 +299,13 @@ def parse(text: str) -> PromptResult:
             result.random_seed = True
 
     return result
+
+
+def concept_for_form(form_id: str) -> str | None:
+    """经典形态 → 概念模型 id（概念库里同名的直接对应）。"""
+    alias = {"shell": "seashell"}
+    cid = alias.get(form_id, form_id)
+    return cid if cid in concepts.CONCEPT_MAP else None
 
 
 def _palette_label(palette_id: str) -> str:
@@ -224,11 +325,12 @@ def apply_to(form_id: str, params: dict[str, float], result: PromptResult) -> di
 
 def keywords_help() -> str:
     """给界面用的关键词提示。"""
-    forms = "、".join(f.keywords[0] for f in registry.FORMS)
+    forms = "、".join(c.label for c in concepts.CONCEPTS[:10])
     return (
         "试着这样写：\n"
-        f"· 形态词：{forms}\n"
-        "· 风格词：尖锐 / 柔和 / 扭曲 / 极简 / 繁复 / 修长 / 敦实\n"
+        f"· 想要什么：{forms}…… 共 {len(concepts.CONCEPTS)} 个模型，写别的词也行\n"
+        "· 风格词：圆润 / 尖锐 / 粗糙 / 扭曲 / 极简 / 繁复 / 中空\n"
+        "· 尺寸精度：高 120mm、打印级、精细\n"
         "· 配色词：冰蓝 / 熔岩 / 苔绿 / 月白 / 紫晶 / 琥珀 / 钢铁 / 珊瑚\n"
-        "· 数字：种子 2026、细节 80"
+        "· 数字：种子 2026"
     )
