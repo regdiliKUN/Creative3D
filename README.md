@@ -35,7 +35,7 @@ v2 只能生成 8 个写死的参数化形态。v3 换成了一套**距离场（
 ## 🚀 使用
 
 ### 直接运行
-双击 `3D建模创意生成器.exe`。
+从 [v3.0.0 Release](https://github.com/regdiliKUN/Creative3D/releases/tag/v3.0.0) 下载 `Creative3D_v3.0.0_Windows_x64.zip`，解压后双击 `3D建模创意生成器.exe`。Windows x64 便携版无需另外安装 Python。
 
 ### 从源码运行
 ```bash
